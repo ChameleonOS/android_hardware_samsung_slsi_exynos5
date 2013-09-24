@@ -191,6 +191,7 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
     if ((currentState == OMX_StateLoaded) && (destState == OMX_StateIdle)) {
         ret = Exynos_OMX_Get_Resource(pOMXComponent);
         if (ret != OMX_ErrorNone) {
+            Exynos_OSAL_SignalSet(pExynosComponent->abendStateEvent);
             goto EXIT;
         }
     }
@@ -201,7 +202,7 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
         Exynos_OMX_Release_Resource(pOMXComponent);
     }
 
-    Exynos_OSAL_Log(EXYNOS_LOG_TRACE, "destState: %d", destState);
+    Exynos_OSAL_Log(EXYNOS_LOG_TRACE, "destState: %d currentState: %d", destState, currentState);
     switch (destState) {
     case OMX_StateInvalid:
         switch (currentState) {
@@ -236,7 +237,7 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
                     Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].pauseEvent);
                     pExynosComponent->pExynosPort[i].pauseEvent = NULL;
                     if (pExynosComponent->pExynosPort[i].bufferProcessType == BUFFER_SHARE) {
-                        Exynos_OSAL_SignalTerminate(&pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
+                        Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
                         pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent = NULL;
                     }
                 }
@@ -281,7 +282,7 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
                     Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].pauseEvent);
                     pExynosComponent->pExynosPort[i].pauseEvent = NULL;
                     if (pExynosComponent->pExynosPort[i].bufferProcessType == BUFFER_SHARE) {
-                        Exynos_OSAL_SignalTerminate(&pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
+                        Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
                         pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent = NULL;
                     }
                 }
@@ -357,6 +358,8 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
                 /*
                  * if (CHECK_PORT_TUNNELED == OMX_TRUE) thenTunnel Buffer Free
                  */
+                Exynos_OSAL_SignalSet(pExynosComponent->abendStateEvent);
+                Exynos_OMX_Release_Resource(pOMXComponent);
                 goto EXIT;
             }
             if (pExynosComponent->bMultiThreadProcess == OMX_FALSE) {
@@ -418,7 +421,7 @@ OMX_ERRORTYPE Exynos_OMX_ComponentStateSet(OMX_COMPONENTTYPE *pOMXComponent, OMX
                         Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].pauseEvent);
                         pExynosComponent->pExynosPort[i].pauseEvent = NULL;
                         if (pExynosComponent->pExynosPort[i].bufferProcessType == BUFFER_SHARE) {
-                            Exynos_OSAL_SignalTerminate(&pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
+                            Exynos_OSAL_SignalTerminate(pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent);
                             pExynosComponent->pExynosPort[i].hAllCodecBufferReturnEvent = NULL;
                         }
                     }

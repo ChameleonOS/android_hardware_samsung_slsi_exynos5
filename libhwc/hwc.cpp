@@ -128,6 +128,7 @@ struct exynos5_hwc_composer_device_1_t {
     bool hdmi_hpd;
     bool hdmi_enabled;
     bool hdmi_blanked;
+    bool hdmi_fb_needed;
     int  hdmi_w;
     int  hdmi_h;
 
@@ -197,6 +198,22 @@ inline int WIDTH(const hwc_rect &rect) { return rect.right - rect.left; }
 inline int HEIGHT(const hwc_rect &rect) { return rect.bottom - rect.top; }
 template<typename T> inline T max(T a, T b) { return (a > b) ? a : b; }
 template<typename T> inline T min(T a, T b) { return (a < b) ? a : b; }
+
+static int dup_or_warn(int fence)
+{
+    int dup_fd = dup(fence);
+    if (dup_fd < 0)
+        ALOGW("fence dup failed: %s", strerror(errno));
+    return dup_fd;
+}
+
+static int merge_or_warn(const char *name, int f1, int f2)
+{
+    int merge_fd = sync_merge(name, f1, f2);
+    if (merge_fd < 0)
+        ALOGW("fence merge failed: %s", strerror(errno));
+    return merge_fd;
+}
 
 template<typename T> void align_crop_and_center(T &w, T &h,
         hwc_rect_t *crop, size_t alignment)
@@ -528,8 +545,30 @@ static void hdmi_disable_layer(struct exynos5_hwc_composer_device_1_t *dev,
     ALOGV("%s: layer%d disabled", __func__, hl.id);
 }
 
+static void hdmi_hide_layer(struct exynos5_hwc_composer_device_1_t *dev,
+                            hdmi_layer_t &hl)
+{
+    if (exynos_v4l2_s_ctrl(hl.fd, V4L2_CID_TV_LAYER_PRIO, 0) < 0)
+        ALOGE("%s: layer%d: LAYER_PRIO failed %d", __func__,
+                                                   hl.id, errno);
+}
+
+static void hdmi_show_layer(struct exynos5_hwc_composer_device_1_t *dev,
+                            hdmi_layer_t &hl)
+{
+    int prio = hl.id ? 3 : 2;
+
+    if (exynos_v4l2_s_ctrl(hl.fd, V4L2_CID_TV_LAYER_PRIO, prio) < 0)
+        ALOGE("%s: layer%d: LAYER_PRIO failed %d", __func__,
+                                                   hl.id, errno);
+}
+
 static int hdmi_enable(struct exynos5_hwc_composer_device_1_t *dev)
 {
+    /* hdmi not supported */
+    if (dev->hdmi_mixer0 < 0)
+        return 0;
+
     if (dev->hdmi_enabled)
         return 0;
 
@@ -731,10 +770,10 @@ err:
 bool exynos5_is_offscreen(hwc_layer_1_t &layer,
         struct exynos5_hwc_composer_device_1_t *pdev)
 {
-    return layer.sourceCrop.left > pdev->xres ||
-            layer.sourceCrop.right < 0 ||
-            layer.sourceCrop.top > pdev->yres ||
-            layer.sourceCrop.bottom < 0;
+    return layer.displayFrame.left > pdev->xres ||
+            layer.displayFrame.right < 0 ||
+            layer.displayFrame.top > pdev->yres ||
+            layer.displayFrame.bottom < 0;
 }
 
 size_t exynos5_visible_width(hwc_layer_1_t &layer, int format,
@@ -1009,6 +1048,8 @@ static int exynos5_prepare_hdmi(exynos5_hwc_composer_device_1_t *pdev,
     ALOGV("preparing %u layers for HDMI", contents->numHwLayers);
     hwc_layer_1_t *video_layer = NULL;
 
+    pdev->hdmi_fb_needed = false;
+
     for (size_t i = 0; i < contents->numHwLayers; i++) {
         hwc_layer_1_t &layer = contents->hwLayers[i];
 
@@ -1036,6 +1077,7 @@ static int exynos5_prepare_hdmi(exynos5_hwc_composer_device_1_t *pdev,
             }
         }
 
+        pdev->hdmi_fb_needed = true;
         layer.compositionType = HWC_FRAMEBUFFER;
         dump_layer(&layer);
     }
@@ -1487,9 +1529,7 @@ static int exynos5_set_fimd(exynos5_hwc_composer_device_1_t *pdev,
         if (pdev->bufs.overlay_map[i] != -1) {
             hwc_layer_1_t &layer =
                     contents->hwLayers[pdev->bufs.overlay_map[i]];
-            int dup_fd = dup(fence);
-            if (dup_fd < 0)
-                ALOGW("release fence dup failed: %s", strerror(errno));
+            int dup_fd = dup_or_warn(fence);
             if (pdev->bufs.gsc_map[i].mode == exynos5_gsc_map_t::GSC_M2M) {
                 int gsc_idx = pdev->bufs.gsc_map[i].idx;
                 exynos5_gsc_data_t &gsc = pdev->gsc[gsc_idx];
@@ -1500,7 +1540,7 @@ static int exynos5_set_fimd(exynos5_hwc_composer_device_1_t *pdev,
             }
         }
     }
-    close(fence);
+    contents->retireFenceFd = fence;
 
     return err;
 }
@@ -1508,7 +1548,6 @@ static int exynos5_set_fimd(exynos5_hwc_composer_device_1_t *pdev,
 static int exynos5_set_hdmi(exynos5_hwc_composer_device_1_t *pdev,
         hwc_display_contents_1_t* contents)
 {
-    hwc_layer_1_t *fb_layer = NULL;
     hwc_layer_1_t *video_layer = NULL;
 
     if (!pdev->hdmi_enabled) {
@@ -1557,19 +1596,37 @@ static int exynos5_set_hdmi(exynos5_hwc_composer_device_1_t *pdev,
 
             gsc.dst_buf_fence[gsc.current_buf] = releaseFenceFd;
             gsc.current_buf = (gsc.current_buf + 1) % NUM_GSC_DST_BUFS;
+            if (contents->retireFenceFd < 0)
+                contents->retireFenceFd = dup_or_warn(releaseFenceFd);
+            else {
+                int merged = merge_or_warn("hdmi",
+                        contents->retireFenceFd, layer.releaseFenceFd);
+                close(contents->retireFenceFd);
+                contents->retireFenceFd = merged;
+            }
         }
 
         if (layer.compositionType == HWC_FRAMEBUFFER_TARGET) {
-            if (!layer.handle)
-                continue;
+            if (pdev->hdmi_fb_needed && layer.handle) {
+                ALOGV("HDMI FB layer:");
+                dump_layer(&layer);
 
-            ALOGV("HDMI FB layer:");
-            dump_layer(&layer);
+                private_handle_t *h = private_handle_t::dynamicCast(layer.handle);
+                hdmi_show_layer(pdev, pdev->hdmi_layers[1]);
+                hdmi_output(pdev, pdev->hdmi_layers[1], layer, h, layer.acquireFenceFd,
+                                                                 &layer.releaseFenceFd);
 
-            private_handle_t *h = private_handle_t::dynamicCast(layer.handle);
-            hdmi_output(pdev, pdev->hdmi_layers[1], layer, h, layer.acquireFenceFd,
-                                                             &layer.releaseFenceFd);
-            fb_layer = &layer;
+                if (contents->retireFenceFd < 0)
+                    contents->retireFenceFd = dup_or_warn(layer.releaseFenceFd);
+                else {
+                    int merged = merge_or_warn("hdmi",
+                            contents->retireFenceFd, layer.releaseFenceFd);
+                    close(contents->retireFenceFd);
+                    contents->retireFenceFd = merged;
+                }
+            } else {
+                hdmi_hide_layer(pdev, pdev->hdmi_layers[1]);
+            }
         }
     }
 
@@ -1577,8 +1634,6 @@ static int exynos5_set_hdmi(exynos5_hwc_composer_device_1_t *pdev,
         hdmi_disable_layer(pdev, pdev->hdmi_layers[0]);
         exynos5_cleanup_gsc_m2m(pdev, HDMI_GSC_IDX);
     }
-    if (!fb_layer)
-        hdmi_disable_layer(pdev, pdev->hdmi_layers[1]);
 
     if (exynos_v4l2_s_ctrl(pdev->hdmi_layers[1].fd, V4L2_CID_TV_UPDATE, 1) < 0) {
         ALOGE("%s: s_ctrl(CID_TV_UPDATE) failed %d", __func__, errno);
@@ -1960,6 +2015,52 @@ static int exynos5_getDisplayAttributes(struct hwc_composer_device_1 *dev,
 
 static int exynos5_close(hw_device_t* device);
 
+static void get_screen_res(const char *fbname, int32_t *xres, int32_t *yres,
+                           int32_t *refresh)
+{
+    char *path;
+    int fd;
+    char buf[128];
+    int ret;
+    unsigned int _x, _y, _r;
+
+    asprintf(&path, "/sys/class/graphics/%s/modes", fbname);
+    if (!path)
+        goto err_asprintf;
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        goto err_open;
+    ret = read(fd, buf, sizeof(buf));
+    if (ret <= 0)
+        goto err_read;
+    buf[sizeof(buf)-1] = '\0';
+
+    ret = sscanf(buf, "U:%ux%up-%u", &_x, &_y, &_r);
+    if (ret != 3)
+        goto err_sscanf;
+
+    ALOGI("Using %ux%u %uHz resolution for '%s' from modes list\n",
+          _x, _y, _r, fbname);
+
+    *xres = (int32_t)_x;
+    *yres = (int32_t)_y;
+    *refresh = (int32_t)_r;
+
+    close(fd);
+    free(path);
+    return;
+
+err_sscanf:
+err_read:
+    close(fd);
+err_open:
+    free(path);
+err_asprintf:
+    *xres = 2560;
+    *yres = 1600;
+    *refresh = 60;
+}
+
 static int exynos5_open(const struct hw_module_t *module, const char *name,
         struct hw_device_t **device)
 {
@@ -2003,22 +2104,14 @@ static int exynos5_open(const struct hw_module_t *module, const char *name,
         goto err_ioctl;
     }
 
-    refreshRate = 1000000000000LLU /
-        (
-         uint64_t( info.upper_margin + info.lower_margin + info.yres )
-         * ( info.left_margin  + info.right_margin + info.xres )
-         * info.pixclock
-        );
-
+    get_screen_res("fb0", &dev->xres, &dev->yres, &refreshRate);
     if (refreshRate == 0) {
         ALOGW("invalid refresh rate, assuming 60 Hz");
         refreshRate = 60;
     }
 
-    dev->xres = 2560;
-    dev->yres = 1600;
-    dev->xdpi = 1000 * (info.xres * 25.4f) / info.width;
-    dev->ydpi = 1000 * (info.yres * 25.4f) / info.height;
+    dev->xdpi = 1000 * (dev->xres * 25.4f) / info.width;
+    dev->ydpi = 1000 * (dev->yres * 25.4f) / info.height;
     dev->vsync_period  = 1000000000 / refreshRate;
 
     ALOGV("using\n"
@@ -2035,11 +2128,8 @@ static int exynos5_open(const struct hw_module_t *module, const char *name,
             dev->gsc[i].dst_buf_fence[j] = -1;
 
     dev->hdmi_mixer0 = open("/dev/v4l-subdev7", O_RDWR);
-    if (dev->hdmi_mixer0 < 0) {
+    if (dev->hdmi_mixer0 < 0)
         ALOGE("failed to open hdmi mixer0 subdev");
-        ret = dev->hdmi_mixer0;
-        goto err_ioctl;
-    }
 
     dev->hdmi_layers[0].id = 0;
     dev->hdmi_layers[0].fd = open("/dev/video16", O_RDWR);
@@ -2109,7 +2199,8 @@ static int exynos5_open(const struct hw_module_t *module, const char *name,
 err_vsync:
     close(dev->vsync_fd);
 err_mixer0:
-    close(dev->hdmi_mixer0);
+    if (dev->hdmi_mixer0 >= 0)
+        close(dev->hdmi_mixer0);
 err_hdmi1:
     close(dev->hdmi_layers[0].fd);
 err_hdmi0:
@@ -2133,7 +2224,8 @@ static int exynos5_close(hw_device_t *device)
         exynos5_cleanup_gsc_m2m(dev, i);
     gralloc_close(dev->alloc_device);
     close(dev->vsync_fd);
-    close(dev->hdmi_mixer0);
+    if (dev->hdmi_mixer0 >= 0)
+        close(dev->hdmi_mixer0);
     close(dev->hdmi_layers[0].fd);
     close(dev->hdmi_layers[1].fd);
     close(dev->fd);
